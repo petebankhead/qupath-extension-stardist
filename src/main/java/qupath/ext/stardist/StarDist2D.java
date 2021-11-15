@@ -34,8 +34,10 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+import org.bytedeco.javacpp.Pointer;
 import org.bytedeco.javacpp.PointerScope;
 import org.bytedeco.javacpp.indexer.FloatIndexer;
 import org.bytedeco.opencv.global.opencv_core;
@@ -550,36 +552,11 @@ public class StarDist2D {
 			
 //			var padding = pad > 0 ? Padding.symmetric(pad) : Padding.empty();
 			var mergedOps = new ArrayList<>(ops);
-			var dnn = this.dnn;
+			Supplier<DnnModel<?>> dnnSupplier;
 			if (dnn == null) {
-				var file = new File(modelPath);
-				if (!file.exists()) {
-					throw new IllegalArgumentException("I couldn't find the model file " + file.getAbsolutePath());
-				}
-				if (file.isFile()) {
-					try {
-						dnn = DnnTools.builder(modelPath)
-								.build();
-						logger.debug("Loaded model {} with OpenCV DNN", modelPath);
-					} catch (Exception e) {
-						logger.error("Unable to load model file with OpenCV. If you intended to use TensorFlow, you need to have it on the classpath & provide the "
-								+ "path to the directory, not the .pb file.");
-						logger.error(e.getLocalizedMessage(), e);
-						throw new RuntimeException("Unable to load StarDist model from " + modelPath, e);
-					}
-				} else {
-					try {
-						// For backwards compatibility, we try to support TensorFlow if the extension is installed
-						var clsTF = Class.forName("qupath.ext.tensorflow.TensorFlowTools");
-						var method = clsTF.getMethod("createDnnModel", String.class);
-						dnn = (DnnModel<?>)method.invoke(null, modelPath);
-						logger.debug("Loaded model {} with TensorFlow", modelPath);
-					} catch (Exception e) {
-						logger.error("Unable to load TensorFlow with reflection - are you sure it is available and on the classpath?");
-						logger.error(e.getLocalizedMessage(), e);
-						throw new RuntimeException("Unable to load StarDist model from " + modelPath, e);
-					}
-				}
+				dnnSupplier = () -> loadDnnModel(modelPath);
+			} else {
+				dnnSupplier = () -> this.dnn;
 			}
 			
 //			var mlOp = ImageOps.ML.dnn(dnn, tileWidth, tileHeight, padding);
@@ -588,7 +565,7 @@ public class StarDist2D {
 			
 			stardist.op = ImageOps.buildImageDataOp(channels)
 					.appendOps(mergedOps.toArray(ImageOp[]::new));
-			stardist.dnn = dnn;
+			stardist.dnnSupplier = dnnSupplier;
 			stardist.threshold = threshold;
 			stardist.pixelSize = pixelSize;
 			stardist.cellConstrainScale = cellConstrainScale;
@@ -618,6 +595,39 @@ public class StarDist2D {
 			return stardist;
 		}
 		
+		private static DnnModel<?> loadDnnModel(String modelPath) {
+			var file = new File(modelPath);
+			if (!file.exists()) {
+				throw new IllegalArgumentException("I couldn't find the model file " + file.getAbsolutePath());
+			}
+			DnnModel<?> dnn;
+			if (file.isFile()) {
+				try {
+					dnn = DnnTools.builder(modelPath)
+							.build();
+					logger.debug("Loaded model {} with OpenCV DNN", modelPath);
+				} catch (Exception e) {
+					logger.error("Unable to load model file with OpenCV. If you intended to use TensorFlow, you need to have it on the classpath & provide the "
+							+ "path to the directory, not the .pb file.");
+					logger.error(e.getLocalizedMessage(), e);
+					throw new RuntimeException("Unable to load StarDist model from " + modelPath, e);
+				}
+			} else {
+				try {
+					// For backwards compatibility, we try to support TensorFlow if the extension is installed
+					var clsTF = Class.forName("qupath.ext.tensorflow.TensorFlowTools");
+					var method = clsTF.getMethod("createDnnModel", String.class);
+					dnn = (DnnModel<?>)method.invoke(null, modelPath);
+					logger.debug("Loaded model {} with TensorFlow", modelPath);
+				} catch (Exception e) {
+					logger.error("Unable to load TensorFlow with reflection - are you sure it is available and on the classpath?");
+					logger.error(e.getLocalizedMessage(), e);
+					throw new RuntimeException("Unable to load StarDist model from " + modelPath, e);
+				}
+			}
+			return dnn;
+		}
+		
 	}
 	
 	private boolean doLog = false;
@@ -627,7 +637,16 @@ public class StarDist2D {
 	private double threshold;
 	
 	private ImageDataOp op;
-	private DnnModel<?> dnn;
+	
+	/**
+	 * Use a {@link Supplier} rather than a {@link DnnModel} directly because this means we can wrap 
+	 * everything in a {@link PointerScope} to ensure appropriate cleanup.
+	 * This aims to resolve https://github.com/qupath/qupath-extension-stardist/issues/11
+	 * If it still possible to provide a {@link DnnModel} explicitly, in which case the {@link PointerScope} 
+	 * does not perform cleanup.
+	 */
+//	private DnnModel<?> dnn;
+	private Supplier<DnnModel<?>> dnnSupplier;
 	private double pixelSize;
 	private double cellExpansion;
 	private double cellConstrainScale;
@@ -665,7 +684,15 @@ public class StarDist2D {
 	 * @param parents the parent objects; existing child objects will be removed, and replaced by the detected cells
 	 */
 	public void detectObjects(ImageData<BufferedImage> imageData, Collection<? extends PathObject> parents) {
+		if (parents.isEmpty())
+			return;
+		if (parents.size() == 1) {
+			detectObjects(imageData, parents.iterator().next(), true);
+			return;
+		}
 		runInPool(() -> detectObjectsImpl(imageData, parents));		
+//		System.gc();
+//		Pointer.deallocateReferences();
 	}
 
 	/**
@@ -676,7 +703,11 @@ public class StarDist2D {
 	 * @param fireUpdate if true, a hierarchy update will be fired on completion
 	 */
 	public void detectObjects(ImageData<BufferedImage> imageData, PathObject parent, boolean fireUpdate) {
-		runInPool(() -> detectObjectsImpl(imageData, parent, fireUpdate));
+		try (var scope = new PointerScope()) {
+			var dnn = getDnnModel();
+			runInPool(() -> detectObjectsImpl(imageData, parent, dnn, fireUpdate));
+			scope.deallocate();
+		}
 	}
 	
 	/**
@@ -709,17 +740,15 @@ public class StarDist2D {
 		
 	private void detectObjectsImpl(ImageData<BufferedImage> imageData, Collection<? extends PathObject> parents) {
 
-		if (parents.isEmpty())
-			return;
-		if (parents.size() == 1) {
-			detectObjects(imageData, parents.iterator().next(), true);
-			return;
-		}
 		log("Processing {} parent objects", parents.size());
-		if (nThreads >= 0)
-			parents.stream().forEach(p -> detectObjects(imageData, p, false));
-		else
-			parents.parallelStream().forEach(p -> detectObjects(imageData, p, false));
+		try (var scope = new PointerScope()) {
+			var dnn = getDnnModel();
+			if (nThreads >= 0)
+				parents.stream().forEach(p -> detectObjectsImpl(imageData, p, dnn, false));
+			else
+				parents.parallelStream().forEach(p -> detectObjectsImpl(imageData, p, dnn, false));
+			scope.deallocate();
+		}
 		
 		// Fire a global update event
 		imageData.getHierarchy().fireHierarchyChangedEvent(imageData.getHierarchy());
@@ -731,15 +760,16 @@ public class StarDist2D {
 	 * 
 	 * @param imageData the image data containing the object
 	 * @param parent the parent object; existing child objects will be removed, and replaced by the detected cells
+	 * @param dnn the DnnModel to use
 	 * @param fireUpdate if true, a hierarchy update will be fired on completion
 	 */
-	private void detectObjectsImpl(ImageData<BufferedImage> imageData, PathObject parent, boolean fireUpdate) {
+	private void detectObjectsImpl(ImageData<BufferedImage> imageData, PathObject parent, DnnModel<?> dnn, boolean fireUpdate) {
 		Objects.nonNull(parent);
 		// Lock early, so the user doesn't make modifications
 		boolean wasLocked = parent.isLocked();
 		parent.setLocked(true);
 		
-		List<PathObject> detections = detectObjects(imageData, parent.getROI());	
+		List<PathObject> detections = detectObjectsImpl(imageData, parent.getROI(), dnn);	
 		
 		if (cancelRuns) {
 			logger.warn("StarDist detection cancelled for {}", parent);
@@ -754,7 +784,12 @@ public class StarDist2D {
 			imageData.getHierarchy().fireHierarchyChangedEvent(imageData.getHierarchy(), parent);
 	}
 	
-	
+	private DnnModel<?> getDnnModel() {
+		var dnn = dnnSupplier.get();
+		dnn.getBlobFunction();
+		dnn.getPredictionFunction();
+		return dnn;
+	}
 	
 	/**
 	 * Detect cells within a {@link ROI}.
@@ -763,6 +798,13 @@ public class StarDist2D {
 	 * @return the detected objects. Note that these will not automatically be added to the object hierarchy.
 	 */
 	public List<PathObject> detectObjects(ImageData<BufferedImage> imageData, ROI roi) {
+		try (@SuppressWarnings("unchecked")
+		var scope = new PointerScope()) {
+			return detectObjectsImpl(imageData, roi, getDnnModel());
+		}
+	}
+		
+	private List<PathObject> detectObjectsImpl(ImageData<BufferedImage> imageData, ROI roi, DnnModel<?> dnn) {
 
 		var resolution = imageData.getServer().getPixelCalibration();
 		if (Double.isFinite(pixelSize) && pixelSize > 0) {
